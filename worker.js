@@ -2,14 +2,14 @@
  * Cloudflare Worker 反向代理
  *
  * 对外访问域名：
- *   proxy.example.com
+ *   example.com
  *
  * 上游应用域名：
- *   my-app.vercel.app
+ *   upstream.example.com
  *
  * 主要功能：
  * 1. 保留原请求的方法、路径、查询参数和请求体
- * 2. 将请求转发到指定的 Vercel 应用
+ * 2. 将请求转发到指定的上游应用
  * 3. 将上游重定向地址改写回对外访问域名
  * 4. 处理上游 Set-Cookie 中的 Domain 属性
  * 5. 根据需要改写 Origin 和 Referer
@@ -22,7 +22,7 @@
 /**
  * Worker 配置。
  *
- * 如果以后需要增加多个 Vercel 上游，可以继续向 upstreamHosts
+ * 如果以后需要增加多个上游，可以继续向 upstreamHosts
  * 数组中添加域名。
  */
 const CONFIG = {
@@ -32,7 +32,7 @@ const CONFIG = {
    * 请求的 HTTP Host 必须在此列表中，否则返回 421。
    */
   allowedHosts: [
-    "proxy.example.com",
+    "example.com",
   ],
 
   /**
@@ -41,17 +41,17 @@ const CONFIG = {
    * 不要填写 https://，也不要包含路径。
    */
   upstreamHosts: [
-    "my-app.vercel.app",
+    "upstream.example.com",
   ],
 
   /**
    * 是否将上游的绝对重定向地址改写回对外域名。
    *
    * 例如：
-   * https://my-app.vercel.app/login
+   * https://upstream.example.com/login
    *
    * 改写为：
-   * https://proxy.example.com/login
+   * https://example.com/login
    */
   rewriteLocation: true,
 
@@ -59,7 +59,7 @@ const CONFIG = {
    * 是否处理上游响应中的 Set-Cookie。
    *
    * 如果上游 Cookie 明确指定：
-   * Domain=my-app.vercel.app
+   * Domain=upstream.example.com
    *
    * Worker 会移除该 Domain 属性，使 Cookie 成为当前对外域名的
    * Host-only Cookie。
@@ -92,7 +92,7 @@ const CONFIG = {
    * 是否允许健康检查接口。
    *
    * 健康检查地址：
-   * https://proxy.example.com/__proxy_health
+   * https://example.com/__proxy_health
    */
   enableHealthCheck: true,
 };
@@ -148,7 +148,7 @@ async function handleRequest(request) {
   /**
    * Worker 自身的健康检查接口。
    *
-   * 此请求不会被转发到 Vercel。
+   * 此请求不会被转发到上游。
    */
   if (
     CONFIG.enableHealthCheck &&
@@ -219,7 +219,7 @@ async function handleRequest(request) {
      * 使用 manual 模式禁止自动跟随重定向。
      *
      * 这样 Worker 才能取得上游的 Location 响应头，并将其中的
-     * Vercel 域名改写回对外域名。
+     * 上游域名改写回对外域名。
      */
     upstreamResponse = await fetch(upstreamRequest, {
       redirect: "manual",
@@ -281,7 +281,7 @@ function buildUpstreamRequest({
    * 删除客户端传入的 Host。
    *
    * Worker 会根据 upstreamUrl.hostname 自动使用正确的上游主机名，
-   * 避免 Vercel 收到 proxy.example.com 作为内部请求目标。
+   * 避免上游收到 example.com 作为内部请求目标。
    */
   headers.delete("host");
 
@@ -383,7 +383,7 @@ function buildClientResponse({
   );
 
   /**
-   * 将上游重定向地址中的 Vercel 域名改写为公开域名。
+   * 将上游重定向地址中的上游域名改写为公开域名。
    */
   if (CONFIG.rewriteLocation) {
     rewriteLocationHeader({
@@ -483,10 +483,10 @@ function copyResponseHeaders(sourceHeaders) {
  * 改写上游返回的 Location 响应头。
  *
  * 例如：
- * https://my-app.vercel.app/login
+ * https://upstream.example.com/login
  *
  * 改写为：
- * https://proxy.example.com/login
+ * https://example.com/login
  *
  * 指向其他第三方域名的跳转不会被修改。
  *
@@ -550,12 +550,12 @@ function rewriteLocationHeader({
  * 复制并改写所有 Set-Cookie 响应头。
  *
  * 如果上游 Cookie 包含：
- * Domain=my-app.vercel.app
+ * Domain=upstream.example.com
  *
  * 则移除 Domain 属性。
  *
- * 浏览器从 proxy.example.com 收到不带 Domain 的 Cookie 后，
- * 会将它作为 proxy.example.com 的 Host-only Cookie。
+ * 浏览器从 example.com 收到不带 Domain 的 Cookie 后，
+ * 会将它作为 example.com 的 Host-only Cookie。
  *
  * @param {object} params
  */
@@ -649,7 +649,7 @@ function rewriteRequestHeaderUrl(
   headerName,
   publicHost,
   upstreamHost,
-}) {
+) {
   const value = headers.get(headerName);
 
   if (!value || value === "null") {
