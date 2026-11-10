@@ -32,6 +32,11 @@
  *    避免"隐藏上游"的部署目标被自身配置泄露。
  * F. 超时语义修正为"等待上游响应头的最长时间（TTFB）"，
  *    不约束响应体流式传输，因此不会中断 SSE / WebSocket 长连接。
+ * G. 端口进入上游配置：通过三组并行环境变量按索引一一对应
+ *    （PROXY_UPSTREAM_HOSTS / PROXY_UPSTREAM_PORTS / PROXY_PUBLIC_HOSTS），
+ *    支持 9090、20252 等非标准端口（Workers 的 fetch 子请求不受
+ *    Cloudflare 回源端口白名单限制）；不配端口即回落 Cloudflare
+ *    默认代理规则（https 443）。
  */
 
 /**
@@ -49,21 +54,44 @@ const CONFIG_DEFAULTS = {
   allowedHosts: ["example.com"],
 
   /**
-   * 上游应用域名列表。
+   * 上游配置块列表（域名 + 端口 + 路由）。
    *
-   * 不要填写 https://，也不要包含路径。
+   * 每个元素是一个上游配置块：
+   * {
+   *   host:       上游主机名或 IP（必填）。不要带 https:// 和路径。
+   *   port:       上游端口（数字或数字字符串）。
+   *               空字符串 "" 表示使用协议默认端口（443 / 80）。
+   *               支持 9090、20252 等非标准端口——Workers 的 fetch
+   *               子请求不受 Cloudflare 回源端口白名单限制（该白名单
+   *               只约束 CDN 代理通道，不约束 Workers）。
+   *   protocol:   "https:" 或 "http:"（全局统一，默认 "https:"）。
+   *   publicHost: 该配置块只服务哪个对外域名（可选，小写）。
+   *               空字符串表示通配：任何对外域名都可路由到此上游。
+   * }
+   *
+   * 端口映射关系（重要，必读）：
+   *
+   *   客户端永远只能通过标准端口（443）访问本 Worker——
+   *   Cloudflare 边缘不监听 9090 / 20252 这样的非标端口，
+   *   https://example.com:9090 在边缘层就会被拒绝，与 Worker 无关。
+   *
+   *   端口映射发生在 Worker → 上游这一段：
+   *     https://app.example.com/api  →  http://10.0.0.2:9090/api
+   *     https://nas.example.com/web  →  http://10.0.0.2:20252/web
+   *
+   * 路由规则：
+   *   1. 优先在 publicHost 等于请求 Host 的配置块中选择；
+   *   2. 没有匹配时，在 publicHost 为空的通配配置块中随机选择
+   *      （保留原有多上游负载均衡语义）。
    */
-  upstreamHosts: ["upstream.example.com"],
-
-  /**
-   * 访问上游使用的协议。
-   */
-  upstreamProtocol: "https:",
-
-  /**
-   * 访问上游使用的端口，空字符串表示协议默认端口。
-   */
-  upstreamPort: "",
+  upstreams: [
+    {
+      host: "upstream.example.com",
+      port: "",
+      protocol: "https:",
+      publicHost: "",
+    },
+  ],
 
   /**
    * 是否将上游的绝对重定向地址改写回对外域名。
@@ -240,13 +268,82 @@ function loadConfig(env) {
       ? "rewrite"
       : "strip";
 
+  /**
+   * 按逗号拆分但保留空项（不转小写之外的加工），
+   * 用于与上游列表按索引对齐的并行变量：
+   * 空项表示"该位置不设置此属性"。
+   */
+  const parseParallel = (value) => {
+    if (value === undefined || value === null || value === "") {
+      return [];
+    }
+    return String(value)
+      .split(",")
+      .map((item) => item.trim().toLowerCase());
+  };
+
+  /**
+   * 解析上游配置：三组并行变量按索引一一对应。
+   *
+   *   PROXY_UPSTREAM_HOSTS = 10.0.0.2,10.0.0.2
+   *   PROXY_UPSTREAM_PORTS = 9090,20252
+   *   PROXY_PUBLIC_HOSTS   = app.example.com,nas.example.com
+   *
+   * 即：第 1 个上游 = app.example.com → 10.0.0.2:9090
+   *     第 2 个上游 = nas.example.com → 10.0.0.2:20252
+   *
+   * 留空规则（不填 = 保持 Cloudflare 默认代理行为）：
+   *   PORTS 某项为空        → 协议默认端口（443 / 80）
+   *   PUBLIC_HOSTS 某项为空 → 通配，任何对外域名都可路由到该上游
+   *   PROXY_UPSTREAM_PROTOCOL 不设置 → 全局 https
+   *   全部不设置            → 使用代码内默认配置
+   */
+  const parseUpstreams = () => {
+    const hosts = parseList(e.PROXY_UPSTREAM_HOSTS, null);
+
+    if (!hosts || hosts.length === 0) {
+      return CONFIG_DEFAULTS.upstreams;
+    }
+
+    const protocol = normalizeProtocol(
+      e.PROXY_UPSTREAM_PROTOCOL,
+      CONFIG_DEFAULTS.upstreams[0].protocol,
+    );
+
+    /**
+     * 端口并行列表；兼容更早版本的单端口变量 PROXY_UPSTREAM_PORT
+     * （设置后对列表中所有上游生效）。
+     */
+    let ports = parseParallel(e.PROXY_UPSTREAM_PORTS);
+    if (
+      ports.length === 0 &&
+      e.PROXY_UPSTREAM_PORT !== undefined &&
+      e.PROXY_UPSTREAM_PORT !== null &&
+      e.PROXY_UPSTREAM_PORT !== ""
+    ) {
+      ports = hosts.map(() => String(e.PROXY_UPSTREAM_PORT).trim());
+    }
+
+    const publicHosts = parseParallel(e.PROXY_PUBLIC_HOSTS);
+
+    return hosts.map((host, index) => ({
+      host,
+      port: ports[index] || "",
+      protocol,
+      publicHost: publicHosts[index] || "",
+    }));
+  };
+
+  const upstreams = parseUpstreams();
+
   return {
     allowedHosts: parseList(e.PROXY_ALLOWED_HOSTS, CONFIG_DEFAULTS.allowedHosts),
-    upstreamHosts: parseList(e.PROXY_UPSTREAM_HOSTS, CONFIG_DEFAULTS.upstreamHosts),
-    upstreamProtocol: normalizeProtocol(e.PROXY_UPSTREAM_PROTOCOL, CONFIG_DEFAULTS.upstreamProtocol),
-    upstreamPort: e.PROXY_UPSTREAM_PORT === undefined || e.PROXY_UPSTREAM_PORT === null
-      ? CONFIG_DEFAULTS.upstreamPort
-      : String(e.PROXY_UPSTREAM_PORT),
+    upstreams,
+    /**
+     * 上游主机名列表（由配置块派生），
+     * 供 Location 改写和健康检查诊断使用。
+     */
+    upstreamHosts: upstreams.map((entry) => entry.host),
     rewriteLocation: parseBool(e.PROXY_REWRITE_LOCATION, CONFIG_DEFAULTS.rewriteLocation),
     rewriteCookies: parseBool(e.PROXY_REWRITE_COOKIES, CONFIG_DEFAULTS.rewriteCookies),
     cookieDomainMode,
@@ -305,7 +402,7 @@ async function handleRequest(request, config) {
     };
 
     if (config.addDiagnosticHeaders) {
-      payload.upstreams = config.upstreamHosts;
+      payload.upstreams = config.upstreams;
     }
 
     return Response.json(payload, {
@@ -324,7 +421,13 @@ async function handleRequest(request, config) {
    * 方法和请求头，避免 Worker 无条件放宽安全限制。
    */
 
-  const upstreamHost = selectUpstream(config.upstreamHosts);
+  /**
+   * 按路由规则选择上游配置块（含 host / port / protocol）。
+   *
+   * 端口映射在此生效：客户端走标准端口 443 进入，
+   * 这里把目标改写到配置块指定的上游端口（如 9090 / 20252）。
+   */
+  const upstream = selectUpstream(config.upstreams, publicHost);
 
   /**
    * 复制原始 URL。
@@ -333,16 +436,16 @@ async function handleRequest(request, config) {
    */
   const upstreamUrl = new URL(incomingUrl.toString());
 
-  upstreamUrl.protocol = config.upstreamProtocol;
-  upstreamUrl.hostname = upstreamHost;
-  upstreamUrl.port = config.upstreamPort;
+  upstreamUrl.protocol = upstream.protocol;
+  upstreamUrl.hostname = upstream.host;
+  upstreamUrl.port = upstream.port;
 
   const upstreamRequest = buildUpstreamRequest({
     request,
     incomingUrl,
     upstreamUrl,
     publicHost,
-    upstreamHost,
+    upstream,
     config,
   });
 
@@ -410,7 +513,7 @@ async function handleRequest(request, config) {
     upstreamResponse,
     incomingUrl,
     publicHost,
-    upstreamHost,
+    upstream,
     config,
   });
 }
@@ -426,7 +529,7 @@ function buildUpstreamRequest({
   incomingUrl,
   upstreamUrl,
   publicHost,
-  upstreamHost,
+  upstream,
   config,
 }) {
   const headers = new Headers(request.headers);
@@ -486,18 +589,14 @@ function buildUpstreamRequest({
       headers,
       "origin",
       publicHost,
-      upstreamHost,
-      config.upstreamProtocol,
-      config.upstreamPort,
+      upstream,
     );
 
     rewriteRequestHeaderUrl(
       headers,
       "referer",
       publicHost,
-      upstreamHost,
-      config.upstreamProtocol,
-      config.upstreamPort,
+      upstream,
     );
   }
 
@@ -529,7 +628,7 @@ function buildClientResponse({
   upstreamResponse,
   incomingUrl,
   publicHost,
-  upstreamHost,
+  upstream,
   config,
 }) {
   /**
@@ -549,7 +648,7 @@ function buildClientResponse({
       headers,
       incomingUrl,
       publicHost,
-      upstreamHost,
+      upstream,
       config,
     });
   }
@@ -624,7 +723,7 @@ function buildClientResponse({
 
     headers.set(
       "X-Reverse-Proxy-Upstream",
-      upstreamHost,
+      upstream.host + (upstream.port ? `:${upstream.port}` : ""),
     );
   }
 
@@ -680,7 +779,7 @@ function rewriteLocationHeader({
   headers,
   incomingUrl,
   publicHost,
-  upstreamHost,
+  upstream,
   config,
 }) {
   const location = headers.get("location");
@@ -698,7 +797,7 @@ function rewriteLocationHeader({
      */
     const redirectUrl = new URL(
       location,
-      `${config.upstreamProtocol}//${upstreamHost}`,
+      `${upstream.protocol}//${upstream.host}`,
     );
 
     const redirectHost =
@@ -837,17 +936,13 @@ function getSetCookieValues(headers) {
  * @param {Headers} headers
  * @param {string} headerName
  * @param {string} publicHost
- * @param {string} upstreamHost
- * @param {string} upstreamProtocol
- * @param {string} upstreamPort
+ * @param {object} upstream 选中的上游配置块（host / port / protocol）
  */
 function rewriteRequestHeaderUrl(
   headers,
   headerName,
   publicHost,
-  upstreamHost,
-  upstreamProtocol,
-  upstreamPort,
+  upstream,
 ) {
   const value = headers.get(headerName);
 
@@ -861,9 +956,9 @@ function rewriteRequestHeaderUrl(
     if (
       headerUrl.hostname.toLowerCase() === publicHost
     ) {
-      headerUrl.protocol = upstreamProtocol;
-      headerUrl.hostname = upstreamHost;
-      headerUrl.port = upstreamPort;
+      headerUrl.protocol = upstream.protocol;
+      headerUrl.hostname = upstream.host;
+      headerUrl.port = upstream.port;
 
       headers.set(
         headerName,
@@ -878,18 +973,27 @@ function rewriteRequestHeaderUrl(
 }
 
 /**
- * 从上游列表中随机选择一个域名。
+ * 从上游配置块列表中选择本次请求的上游。
  *
- * 当前只有一个上游时，总是返回同一个域名。
+ * 路由规则：
+ *   1. 优先在 publicHost 等于请求对外域名的配置块中选择；
+ *   2. 没有匹配时，在 publicHost 为空的通配配置块中随机选择。
  *
- * 注意：当前不支持多上游故障转移。如果配置了多个上游，
- * 某个上游不可用时该请求会直接失败（502），不会自动
- * 重试其余节点。多上游场景请配合外部健康检查使用。
+ * 只有一个上游时，总是返回同一个配置块。
  *
- * @param {string[]} upstreams
- * @returns {string}
+ * 注意：同一匹配池内的随机选择仅适用于"同一服务的多节点
+ * 负载均衡"。不同端口背后若是不同服务（如 9090 是面板、
+ * 20252 是存储），必须为它们配置不同的 publicHost，
+ * 否则请求会被随机打到错误的服务上。
+ *
+ * 当前不支持池内故障转移：选中的上游不可用时该请求直接
+ * 失败（502），不会自动重试其余节点。
+ *
+ * @param {object[]} upstreams 上游配置块列表
+ * @param {string} publicHost 请求的对外域名（小写）
+ * @returns {object} 选中的上游配置块
  */
-function selectUpstream(upstreams) {
+function selectUpstream(upstreams, publicHost) {
   if (
     !Array.isArray(upstreams) ||
     upstreams.length === 0
@@ -897,11 +1001,24 @@ function selectUpstream(upstreams) {
     throw new Error("未配置任何上游域名");
   }
 
-  const index = Math.floor(
-    Math.random() * upstreams.length,
+  const matched = upstreams.filter(
+    (entry) => entry.publicHost && entry.publicHost === publicHost,
   );
 
-  return upstreams[index];
+  const pool =
+    matched.length > 0
+      ? matched
+      : upstreams.filter((entry) => !entry.publicHost);
+
+  if (pool.length === 0) {
+    throw new Error(`没有可服务 ${publicHost} 的上游配置块`);
+  }
+
+  const index = Math.floor(
+    Math.random() * pool.length,
+  );
+
+  return pool[index];
 }
 
 /**

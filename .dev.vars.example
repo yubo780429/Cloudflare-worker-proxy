@@ -1,0 +1,50 @@
+# Cloudflare Worker 反向代理 —— 本地开发环境变量示例
+#
+# 用法：复制本文件为 .dev.vars 并修改（.dev.vars 不要提交进版本库）。
+#
+# 为什么不是 .env：
+#   wrangler 的 .env 只注入 wrangler 自身进程（如 CLOUDFLARE_API_TOKEN），
+#   不会成为 Worker 的绑定变量。Worker 本地开发的变量文件是 .dev.vars，
+#   线上部署用 wrangler.toml 的 [vars]（密钥用 wrangler secret put）。
+#
+# ---------------- 对外域名白名单（逗号分隔） ----------------
+# 请求的 Host 不在此列表 → 421
+PROXY_ALLOWED_HOSTS=app.example.com,nas.example.com
+
+# ---------------- 上游配置（三组并行变量，按序号一一对应） ----------------
+#
+#   PROXY_UPSTREAM_HOSTS = 被反代的上游主机域名或 IP（必填，逗号分隔）
+#   PROXY_UPSTREAM_PORTS = 上游端口（与 HOSTS 按序号对齐；某项留空 = 默认端口 443/80）
+#   PROXY_PUBLIC_HOSTS   = 每个上游只服务哪个对外域名（与 HOSTS 按序号对齐；
+#                          某项留空 = 通配，任何对外域名都可路由到它）
+#
+# 端口映射说明：
+#   客户端只能走 443 进入 Cloudflare 边缘（边缘不监听 9090/20252）；
+#   端口映射发生在 Worker → 上游这一段，支持任意非标准端口。
+#
+# 下面三行的含义（序号 1→1、2→2 对齐）：
+#   https://app.example.com/...  →  http://10.0.0.2:9090/...
+#   https://nas.example.com/...  →  http://10.0.0.2:20252/...
+PROXY_UPSTREAM_HOSTS=10.0.0.2,10.0.0.2
+PROXY_UPSTREAM_PORTS=9090,20252
+PROXY_PUBLIC_HOSTS=app.example.com,nas.example.com
+
+# ---------------- 上游协议（全局，可选） ----------------
+# 不设置 = https（Cloudflare 标准反代行为）。
+# 上游全是 http（如内网 IP + 非标端口）时设为 http，只需设一次。
+PROXY_UPSTREAM_PROTOCOL=http
+
+# ---------------- 行为开关 ----------------
+# Set-Cookie Domain 处理：strip（默认，host-only 更安全）/ rewrite（多子域共享登录态）
+PROXY_COOKIE_DOMAIN_MODE=strip
+# 诊断响应头（默认 false，开启会暴露上游域名与端口）
+PROXY_DIAGNOSTIC_HEADERS=false
+# 等待上游响应头的最长时间（毫秒，只约束 TTFB，不影响 SSE/WebSocket）
+PROXY_TIMEOUT_MS=30000
+# 健康检查 /__proxy_health（默认 true）
+PROXY_HEALTH_CHECK=true
+
+# ---------------- 兼容旧变量 ----------------
+# 单上游老配置仍可用：PROXY_UPSTREAM_PORT（单数）对所有上游生效；
+# 优先级低于 PROXY_UPSTREAM_PORTS。
+# PROXY_UPSTREAM_PORT=9090
