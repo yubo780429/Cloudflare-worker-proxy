@@ -40,13 +40,13 @@ PROXY_UPSTREAM_PROTOCOL = "http"
 本地变量文件是 `.dev.vars`（复制 `.dev.vars.example` 修改；不要用 `.env`，wrangler 不会把它注入 Worker 绑定）：
 
 ```bash
-npx wrangler@3 dev worker.js --ip 127.0.0.1 --port 8787
+npx wrangler@4 dev worker.js --ip 127.0.0.1 --port 8787
 ```
 
 ### 3. 部署
 
 ```bash
-npx wrangler@3 deploy
+npx wrangler@4 deploy
 ```
 
 部署后在 Cloudflare 控制台把 `example.com` 的 DNS 记录（橙色云）指向该 Worker 的路由，上游应用只需放行来自 Cloudflare 的请求。
@@ -141,7 +141,9 @@ https://nas.example.com/web  →（443 进入 Cloudflare 边缘）→  Worker  �
 
 - **入口白名单**：只允许配置的对外域名访问，防止 Worker 被当作公共开放代理。
 - **上游信息隐藏**：默认不输出任何诊断头、健康检查不返回上游域名、上游 `Alt-Svc` 响应头一律删除（否则浏览器会尝试直连上游建立 HTTP/3，泄露并可能绕过代理）。
-- **转发头防伪造**：客户端传入的 `Forwarded` / `X-Forwarded-*` / `X-Real-IP` 一律丢弃，由 Worker 重建可信值。
+- **转发头防伪造**：客户端传入的 `Forwarded` / `X-Forwarded-*` / `X-Real-IP` 一律丢弃，由 Worker 重建可信值（已经断言级测试：伪造值不会到达上游）。
+- **日志脱敏**：错误日志只记录 origin + 路径，查询串（可能携带 token）一律剔除。
+- **配置告警**：非法布尔值 / 非法协议 / 非法端口 / 并行列表长度错位 / 路由域名不在白名单内，启动后首个请求即输出结构化告警（同一项不重复刷日志），不再静默回落。
 - **hop-by-hop 响应头清理**：`connection` / `transfer-encoding` 等逐跳头不透传给客户端。
 - 如需进一步增强，建议在 Worker 前叠加 Cloudflare Access 或自定义鉴权逻辑（本代码不含鉴权）。
 
@@ -159,25 +161,31 @@ proxy-verify/      # 验证与复现环境（上游服务器 + 三协议测试�
 ## 本地验证复现
 
 ```bash
-# 1. 启动测试上游（WS 回显 / DoH / gRPC 三形态端点，零依赖）
+# 1. 启动测试上游（WS 回显 / DoH / gRPC / echo / SSE 等端点，零依赖）
 node proxy-verify/upstream-server.js
 
 # 2. 用环境变量覆盖启动 Worker（无需改代码）
-npx wrangler@3 dev cloudflare-reverse-proxy/worker.js \
+npx wrangler@4 dev cloudflare-reverse-proxy/worker.js \
   --ip 127.0.0.1 --port 8787 \
+  --compatibility-date 2025-09-01 \
   --var PROXY_ALLOWED_HOSTS:127.0.0.1 \
   --var PROXY_UPSTREAM_HOSTS:127.0.0.1 \
   --var PROXY_UPSTREAM_PROTOCOL:http \
   --var PROXY_UPSTREAM_PORT:9301
 
-# 3. 运行三协议测试
-node proxy-verify/test-ws.js 8787     # WebSocket 回显
-node proxy-verify/test-doh.js 8787    # DoH POST + GET
-node proxy-verify/test-grpc.js 8787   # gRPC 三形态
+# 3. 运行协议与行为断言测试
+node proxy-verify/test-ws.js 8787       # WebSocket 回显
+node proxy-verify/test-doh.js 8787      # DoH POST + GET
+node proxy-verify/test-grpc.js 8787     # gRPC 三形态
+node proxy-verify/test-headers.js 8787  # 伪造头断言（上游实际收到的头集合）
+node proxy-verify/test-cookies.js 8787  # 多 Set-Cookie 逐条透传 + Domain 改写
+node proxy-verify/test-timeout.js 8787  # TTFB 超时（Worker 需以短 PROXY_TIMEOUT_MS 启动）
+node proxy-verify/test-sse.js 8787      # SSE 流式逐条到达
 ```
 
 ## 版本说明
 
-- **优化版（当前）**：基于实测结论的修订——删除 `Alt-Svc` 响应头（必修）、hop-by-hop 头显式清理、配置外置到环境变量、Cookie Domain 双模式（strip/rewrite）、健康检查与诊断头默认脱敏、TTFB 超时语义修正、结构化错误日志。
+- **断言测试加固版（当前）**：修复 `new Request` 三参调用导致头改写静默失效的严重 bug（伪造 `X-Forwarded-*` 可直达上游）；新增伪造头/多 Set-Cookie/TTFB 超时/SSE 断言测试；配置非法值结构化告警（去重）；日志 URL 脱敏；README 工具链更正为 wrangler@4（与生产部署一致）。
+- **优化版**：基于实测结论的修订——删除 `Alt-Svc` 响应头（必修）、hop-by-hop 头显式清理、配置外置到环境变量、Cookie Domain 双模式（strip/rewrite）、健康检查与诊断头默认脱敏、TTFB 超时语义修正、结构化错误日志。
 - **端口配置块版**：端口进入上游配置（`PROXY_UPSTREAMS` JSON），支持非标端口与按对外域名路由；已经 workerd 实测。
-- **并行变量版（当前）**：应可维护性要求，JSON 配置改为三组并行变量（`PROXY_UPSTREAM_HOSTS` / `PROXY_UPSTREAM_PORTS` / `PROXY_PUBLIC_HOSTS`，按序号一一对应）；协议合并为全局可选变量（默认 https）；兼容旧版单端口变量。路由、通配、回落均经 workerd 实测。
+- **并行变量版**：应可维护性要求，JSON 配置改为三组并行变量（`PROXY_UPSTREAM_HOSTS` / `PROXY_UPSTREAM_PORTS` / `PROXY_PUBLIC_HOSTS`，按序号一一对应）；协议合并为全局可选变量（默认 https）；兼容旧版单端口变量。路由、通配、回落均经 workerd 实测。

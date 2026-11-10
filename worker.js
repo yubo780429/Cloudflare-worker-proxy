@@ -190,12 +190,15 @@ export default {
     } catch (error) {
       /**
        * 结构化日志，便于在 Workers Logs / Logpush 中检索。
+       * URL 只记录 origin + 路径，查询串一律剔除——
+       * 查询串可能携带 token（如 ?token=...、DoH 的 ?dns=...），
+       * 明文进日志属于凭证泄露。
        */
       console.error(
         JSON.stringify({
           event: "proxy_unhandled_error",
           method: request.method,
-          url: request.url,
+          url: redactUrl(request.url),
           error: String(error && error.stack ? error.stack : error),
         }),
       );
@@ -215,17 +218,53 @@ export default {
  * @param {object} env Worker 环境变量
  * @returns {object}
  */
+/**
+ * 已告警过的配置项集合（模块级）。
+ *
+ * loadConfig 在每个请求上都会执行，若不抑制重复，
+ * 同一条配置告警会按请求量刷屏 Workers Logs。
+ * 同一字段同一非法值只告警一次（冷启动后首个请求）。
+ */
+const configWarnedKeys = new Set();
+
 function loadConfig(env) {
   const e = env || {};
 
   /**
-   * 解析布尔值。接受 "true" / "false"（不区分大小写）。
+   * 配置告警：结构化输出，便于在 Workers Logs / Logpush 中检索。
+   * 所有"值非法但已回落默认"的情况都会在这里留下痕迹，
+   * 不再静默吞掉。同一 field+value 每个 isolate 只告警一次。
    */
-  const parseBool = (value, fallback) => {
+  const warnConfig = (field, value, reason) => {
+    const key = `${field}:${String(value)}`;
+    if (configWarnedKeys.has(key)) {
+      return;
+    }
+    configWarnedKeys.add(key);
+    console.warn(
+      JSON.stringify({
+        event: "config_warning",
+        field,
+        value: String(value),
+        reason,
+      }),
+    );
+  };
+
+  /**
+   * 解析布尔值。只接受 "true" / "false"（不区分大小写），
+   * 其他非空值告警并按默认值处理——避免 "treu"、"1"、"yes"
+   * 这类笔误被静默解释为 false。
+   */
+  const parseBool = (value, fallback, field) => {
     if (value === undefined || value === null || value === "") {
       return fallback;
     }
-    return String(value).toLowerCase() === "true";
+    const normalized = String(value).trim().toLowerCase();
+    if (normalized === "true") return true;
+    if (normalized === "false") return false;
+    warnConfig(field, value, `无法识别的布尔值，已按默认值 ${fallback} 处理（只接受 true/false）`);
+    return fallback;
   };
 
   /**
@@ -253,20 +292,45 @@ function loadConfig(env) {
 
   /**
    * 规范化协议写法，保证带冒号（URL.protocol 需要）。
+   * 只接受 http / https，其他值告警并回落默认。
    */
   const normalizeProtocol = (value, fallback) => {
-    const proto =
-      value === undefined || value === null || value === ""
-        ? fallback
-        : String(value).toLowerCase();
-
+    if (value === undefined || value === null || value === "") {
+      return fallback;
+    }
+    const proto = String(value).toLowerCase().trim();
+    if (proto !== "http" && proto !== "https" &&
+        proto !== "http:" && proto !== "https:") {
+      warnConfig("PROXY_UPSTREAM_PROTOCOL", value, "只支持 http/https，已按默认值处理");
+      return fallback;
+    }
     return proto.endsWith(":") ? proto : `${proto}:`;
   };
 
+  /**
+   * 校验端口：必须是 1-65535 的数字；非法值告警并视为未设置
+   * （回落协议默认端口）。
+   */
+  const normalizePort = (value) => {
+    if (value === undefined || value === null || String(value).trim() === "") {
+      return "";
+    }
+    const raw = String(value).trim();
+    const num = Number(raw);
+    if (!Number.isInteger(num) || num < 1 || num > 65535) {
+      warnConfig("PROXY_UPSTREAM_PORTS", raw, "端口必须是 1-65535 的整数，已按协议默认端口处理");
+      return "";
+    }
+    return String(num);
+  };
+
+  const cookieDomainModeRaw = String(e.PROXY_COOKIE_DOMAIN_MODE || "").trim().toLowerCase();
   const cookieDomainMode =
-    String(e.PROXY_COOKIE_DOMAIN_MODE || "").toLowerCase() === "rewrite"
+    cookieDomainModeRaw === "rewrite"
       ? "rewrite"
-      : "strip";
+      : cookieDomainModeRaw === "" || cookieDomainModeRaw === "strip"
+        ? "strip"
+        : (warnConfig("PROXY_COOKIE_DOMAIN_MODE", cookieDomainModeRaw, "只支持 strip/rewrite，已按 strip 处理"), "strip");
 
   /**
    * 按逗号拆分但保留空项（不转小写之外的加工），
@@ -326,31 +390,66 @@ function loadConfig(env) {
 
     const publicHosts = parseParallel(e.PROXY_PUBLIC_HOSTS);
 
+    /**
+     * 并行列表长度应与 HOSTS 一致。多出/不足都不该静默：
+     * 多余的项永远不会被读取，缺项意味着该位置用默认值——
+     * 都可能意味着配置错位。
+     */
+    if (ports.length > 0 && ports.length !== hosts.length) {
+      warnConfig(
+        "PROXY_UPSTREAM_PORTS",
+        `${ports.length} 项`,
+        `与 PROXY_UPSTREAM_HOSTS 的 ${hosts.length} 项数量不一致，按序号对齐后可能路由错位`,
+      );
+    }
+    if (publicHosts.length > 0 && publicHosts.length !== hosts.length) {
+      warnConfig(
+        "PROXY_PUBLIC_HOSTS",
+        `${publicHosts.length} 项`,
+        `与 PROXY_UPSTREAM_HOSTS 的 ${hosts.length} 项数量不一致，按序号对齐后可能路由错位`,
+      );
+    }
+
+    /**
+     * PUBLIC_HOSTS 的非空项必须在 ALLOWED_HOSTS 白名单内，
+     * 否则该路由在入口 421 处就已被拦截，永远不可达。
+     */
+    for (const ph of publicHosts) {
+      if (ph && !allowedHosts.includes(ph)) {
+        warnConfig(
+          "PROXY_PUBLIC_HOSTS",
+          ph,
+          "该域名不在 PROXY_ALLOWED_HOSTS 白名单内，对应路由永远不可达（入口已 421）",
+        );
+      }
+    }
+
     return hosts.map((host, index) => ({
       host,
-      port: ports[index] || "",
+      port: normalizePort(ports[index]),
       protocol,
       publicHost: publicHosts[index] || "",
     }));
   };
 
+  const allowedHosts = parseList(e.PROXY_ALLOWED_HOSTS, CONFIG_DEFAULTS.allowedHosts);
   const upstreams = parseUpstreams();
 
   return {
-    allowedHosts: parseList(e.PROXY_ALLOWED_HOSTS, CONFIG_DEFAULTS.allowedHosts),
+    allowedHosts,
     upstreams,
     /**
      * 上游主机名列表（由配置块派生），
      * 供 Location 改写和健康检查诊断使用。
      */
     upstreamHosts: upstreams.map((entry) => entry.host),
-    rewriteLocation: parseBool(e.PROXY_REWRITE_LOCATION, CONFIG_DEFAULTS.rewriteLocation),
-    rewriteCookies: parseBool(e.PROXY_REWRITE_COOKIES, CONFIG_DEFAULTS.rewriteCookies),
+    rewriteLocation: parseBool(e.PROXY_REWRITE_LOCATION, CONFIG_DEFAULTS.rewriteLocation, "PROXY_REWRITE_LOCATION"),
+    rewriteCookies: parseBool(e.PROXY_REWRITE_COOKIES, CONFIG_DEFAULTS.rewriteCookies, "PROXY_REWRITE_COOKIES"),
     cookieDomainMode,
-    rewriteRequestOrigin: parseBool(e.PROXY_REWRITE_ORIGIN, CONFIG_DEFAULTS.rewriteRequestOrigin),
-    addDiagnosticHeaders: parseBool(e.PROXY_DIAGNOSTIC_HEADERS, CONFIG_DEFAULTS.addDiagnosticHeaders),
+    rewriteRequestOrigin: parseBool(e.PROXY_REWRITE_ORIGIN, CONFIG_DEFAULTS.rewriteRequestOrigin, "PROXY_REWRITE_ORIGIN"),
+    addDiagnosticHeaders: parseBool(e.PROXY_DIAGNOSTIC_HEADERS, CONFIG_DEFAULTS.addDiagnosticHeaders, "PROXY_DIAGNOSTIC_HEADERS"),
     upstreamTimeoutMs: parsePositiveInt(e.PROXY_TIMEOUT_MS, CONFIG_DEFAULTS.upstreamTimeoutMs),
-    enableHealthCheck: parseBool(e.PROXY_HEALTH_CHECK, CONFIG_DEFAULTS.enableHealthCheck),
+    enableHealthCheck: parseBool(e.PROXY_HEALTH_CHECK, CONFIG_DEFAULTS.enableHealthCheck, "PROXY_HEALTH_CHECK"),
   };
 }
 
@@ -482,7 +581,7 @@ async function handleRequest(request, config) {
       console.error(
         JSON.stringify({
           event: "upstream_timeout",
-          upstreamUrl: upstreamUrl.toString(),
+          upstreamUrl: redactUrl(upstreamUrl.toString()),
           timeoutMs: config.upstreamTimeoutMs,
         }),
       );
@@ -603,17 +702,19 @@ function buildUpstreamRequest({
   /**
    * 根据新的上游 URL 和原始 Request 构造转发请求。
    *
-   * 这样可以保留：
-   * - HTTP 方法
-   * - 请求体
-   * - Content-Type
-   * - Authorization
-   * - Cookie
-   * - WebSocket Upgrade 请求头
-   * - 其他客户端请求头
+   * 注意（实测修复）：Request 构造器只接受 (input, init) 两个参数。
+   * 此前写成 new Request(url, request, { headers }) ——第三个参数
+   * 会被静默忽略，导致上面的头删除/重建/改写全部不生效，
+   * 伪造的 X-Forwarded-* 原样到达上游。因此改为显式 init：
+   *
+   * - method / body 从原请求继承（GET/HEAD 的 body 为 null，无冲突）
+   * - headers 使用删除伪造头、重建可信头之后的版本
+   * - redirect: manual 禁止自动跟随重定向
    */
-  return new Request(upstreamUrl.toString(), request, {
+  return new Request(upstreamUrl.toString(), {
+    method: request.method,
     headers,
+    body: request.body,
     redirect: "manual",
   });
 }
@@ -1019,6 +1120,24 @@ function selectUpstream(upstreams, publicHost) {
   );
 
   return pool[index];
+}
+
+/**
+ * URL 脱敏：仅保留 origin + 路径，剔除查询串和哈希。
+ *
+ * 用于日志输出——查询串可能携带 token、会话 ID 等凭证，
+ * 不应明文写入 Workers Logs / Logpush。
+ *
+ * @param {string} url
+ * @returns {string}
+ */
+function redactUrl(url) {
+  try {
+    const parsed = new URL(url);
+    return `${parsed.origin}${parsed.pathname}`;
+  } catch {
+    return "<unparseable-url>";
+  }
 }
 
 /**

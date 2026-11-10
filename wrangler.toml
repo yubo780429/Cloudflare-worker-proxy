@@ -1,13 +1,13 @@
-name = "reverse-proxy"
+name = "cfrp"
 main = "worker.js"
-compatibility_date = "2026-11-11"
-account_id = "<your-account-id>"
+compatibility_date = "2025-09-01"
+account_id = ""
 
 # 对外访问域名白名单：当前使用 workers.dev 免费域名。
 # 挂自定义域名时，把自定义域名追加到这里（逗号分隔）。
 [vars]
-PROXY_ALLOWED_HOSTS = "reverse-proxy.example.workers.dev,example.com"
+PROXY_ALLOWED_HOSTS = ""
 
-# 上游：端口不填默认Cloudflare规则（路径随请求透传，客户端请求 /路径 即可）
-PROXY_UPSTREAM_HOSTS = "upstream.example.com"
+# 上游：
+PROXY_UPSTREAM_HOSTS = ""
 PROXY_UPSTREAM_PORTS = ""
