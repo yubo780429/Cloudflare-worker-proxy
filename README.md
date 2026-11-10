@@ -178,6 +178,6 @@ node proxy-verify/test-grpc.js 8787   # gRPC 三形态
 
 ## 版本说明
 
-- **优化版（当前）**：基于实测结论的修订——删除 `Alt-Svc` 响应头（必修）、hop-by-hop 头显式清理、配置外置到环境变量、Cookie Domain 双模式（strip/rewrite）、健康检查与诊断头默认脱敏、TTFB 超时语义修正、结构化错误日志。
+- **优化版**：基于实测结论的修订——删除 `Alt-Svc` 响应头（必修）、hop-by-hop 头显式清理、配置外置到环境变量、Cookie Domain 双模式（strip/rewrite）、健康检查与诊断头默认脱敏、TTFB 超时语义修正、结构化错误日志。
 - **端口配置块版**：端口进入上游配置（`PROXY_UPSTREAMS` JSON），支持非标端口与按对外域名路由；已经 workerd 实测。
 - **并行变量版（当前）**：应可维护性要求，JSON 配置改为三组并行变量（`PROXY_UPSTREAM_HOSTS` / `PROXY_UPSTREAM_PORTS` / `PROXY_PUBLIC_HOSTS`，按序号一一对应）；协议合并为全局可选变量（默认 https）；兼容旧版单端口变量。路由、通配、回落均经 workerd 实测。
