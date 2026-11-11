@@ -151,16 +151,63 @@ https://nas.example.com/web  →（443 进入 Cloudflare 边缘）→  Worker  �
 
 ```
 cloudflare-reverse-proxy/
-├── worker.js           # Worker 全部逻辑（单文件，零依赖）
-├── .dev.vars.example   # 本地变量示例（复制为 .dev.vars 使用）
-└── README.md           # 本文档
+├── worker.js                  # ES Module 入口：加载配置 + 调用编排 + 顶层异常兜底
+├── package.json               # 零依赖测试脚本（npm test）
+├── src/
+│   ├── app/handle-request.js       # 请求生命周期编排（唯一流程协调者）
+│   ├── config/
+│   │   ├── defaults.js             # 默认配置
+│   │   ├── load-config.js          # 解析 env、告警去重
+│   │   └── validate-config.js      # 纯函数校验（非法值告警 + 回落）
+│   ├── routing/select-upstream.js  # 按 publicHost 精确匹配 / 通配选上游
+│   ├── proxy/
+│   │   ├── build-request.js        # 构造转发请求（请求体流式透传）
+│   │   ├── fetch-upstream.js       # 上游 fetch + TTFB 超时
+│   │   └── build-response.js       # 构造客户端响应（响应体流式透传）
+│   ├── headers/
+│   │   ├── request-headers.js      # Host / Forwarded / XFF 重建
+│   │   └── response-headers.js     # hop-by-hop、Alt-Svc、诊断头策略
+│   ├── rewrite/
+│   │   ├── location.js             # Location 改写
+│   │   ├── cookies.js              # Set-Cookie 逐条处理
+│   │   └── origin-referer.js       # Origin / Referer 改写
+│   └── http/
+│       ├── errors.js               # 统一错误响应 + 日志 URL 脱敏
+│       └── health.js               # 健康检查响应
+├── tests/                     # 四组零依赖单元测试（node --test）
+│   ├── config.test.js
+│   ├── routing.test.js
+│   ├── rewrite.test.js
+│   └── proxy.test.js
+├── .dev.vars.example          # 本地变量示例（复制为 .dev.vars 使用）
+├── wrangler.toml              # main = "worker.js"，部署入口不变
+├── README.md                  # 本文档
+├── verify-report.md           # 协议验证报告
 
-proxy-verify/      # 验证与复现环境（上游服务器 + 三协议测试客户端 + 验证报告）
+
+
+proxy-verify/      # 验证与复现环境（上游服务器 + 协议测试客户端 + 验证报告）
 ```
+
+依赖方向单向，底层模块只接收参数并返回结果，不反向导入编排层：
+
+```
+worker.js
+└── app/handle-request.js
+    ├── config/  routing/  proxy/
+    ├── headers/  rewrite/  http/
+    └── （proxy/ 内部再调用 headers/ 与 rewrite/）
+```
+
+wrangler 用 esbuild 自动打包这些 import，**部署产物仍是单文件 `worker.js`**；`wrangler.toml` 的 `main` 无需改动，线上部署命令与变量注入方式完全不变。
 
 ## 本地验证复现
 
 ```bash
+# 0. 单元测试（零依赖，无需启动 Worker 或上游）
+cd cloudflare-reverse-proxy && npm test
+# 四组：config / routing / rewrite / proxy，共 49 个断言
+
 # 1. 启动测试上游（WS 回显 / DoH / gRPC / echo / SSE 等端点，零依赖）
 node proxy-verify/upstream-server.js
 
@@ -185,8 +232,8 @@ node proxy-verify/test-sse.js 8787      # SSE 流式逐条到达
 
 ## 版本说明
 
-
-- **断言测试加固版（当前）**：修复 `new Request` 三参调用导致头改写静默失效的严重 bug（伪造 `X-Forwarded-*` 可直达上游）；新增伪造头/多 Set-Cookie/TTFB 超时/SSE 断言测试；配置非法值结构化告警（去重）；日志 URL 脱敏；README 工具链更正为 wrangler@4（与生产部署一致）。
+- **模块化拆分版（当前）**：按职责把 `worker.js` 拆为 `src/` 下 7 组共 15 个模块，`worker.js` 只保留 ES Module 入口与顶层异常兜底；`src/app/handle-request.js` 为唯一流程协调者，依赖单向。**纯搬移、零行为变更**：拆分前后 9 组端到端基线逐字一致、49 个单元测试通过、`wrangler deploy --dry-run` 打包成功。新增 `tests/` 四组零依赖单元测试与 `package.json` 的 `npm test`；`wrangler.toml` 的 `main = "worker.js"` 不变。
+- **断言测试加固版**：修复 `new Request` 三参调用导致头改写静默失效的严重 bug（伪造 `X-Forwarded-*` 可直达上游）；新增伪造头/多 Set-Cookie/TTFB 超时/SSE 断言测试；配置非法值结构化告警（去重）；日志 URL 脱敏；README 工具链更正为 wrangler@4（与生产部署一致）。
 - **优化版**：基于实测结论的修订——删除 `Alt-Svc` 响应头（必修）、hop-by-hop 头显式清理、配置外置到环境变量、Cookie Domain 双模式（strip/rewrite）、健康检查与诊断头默认脱敏、TTFB 超时语义修正、结构化错误日志。
 - **端口配置块版**：端口进入上游配置（`PROXY_UPSTREAMS` JSON），支持非标端口与按对外域名路由；已经 workerd 实测。
 - **并行变量版**：应可维护性要求，JSON 配置改为三组并行变量（`PROXY_UPSTREAM_HOSTS` / `PROXY_UPSTREAM_PORTS` / `PROXY_PUBLIC_HOSTS`，按序号一一对应）；协议合并为全局可选变量（默认 https）；兼容旧版单端口变量。路由、通配、回落均经 workerd 实测。

@@ -1,13 +1,24 @@
-name = "cfrp"
+name = "reverse-proxy"
 main = "worker.js"
 compatibility_date = "2025-09-01"
+
+# 注意：本文件是 CLI 部署入口，当前为脱敏后的空值模板，直接部署会得到一个
+# 「所有请求 421 / 上游为空」的 Worker。部署前必须填回以下 5 项：
+#   1. name                    —— 实际 Worker 名（改错会新建出另一个 Worker）
+#   2. account_id              —— 账户 ID
+#   3. PROXY_ALLOWED_HOSTS     —— 所有实际对外域名（workers.dev + 自定义域）
+#   4. PROXY_UPSTREAM_HOSTS    —— 上游主机名
+#   5. PROXY_UPSTREAM_PORTS    —— 上游端口（9090 等非标端口必须显式填写）
 account_id = ""
 
-# 对外访问域名白名单：当前使用 workers.dev 免费域名。
-# 挂自定义域名时，把自定义域名追加到这里（逗号分隔）。
+# 对外访问域名白名单（逗号分隔）。
+# 关键：用 wrangler deploy 部署时，这里的 [vars] 会覆盖 Dashboard 中的同名变量。
+# 只要线上还挂了自定义域名，就必须把自定义域名也写进白名单，否则自定义域名的
+# 请求会在入口被 421 拦截，DoH 客户端表现为「收不到应答」，看起来像端口失效。
 [vars]
 PROXY_ALLOWED_HOSTS = ""
 
-# 上游：
+# 上游：DoH 服务（dns-query 路径随请求透传，客户端请求 /dns-query 即可）。
+# 上游只监听非标端口时，PORTS 绝不能留空：留空 = 回落协议默认端口 443。
 PROXY_UPSTREAM_HOSTS = ""
 PROXY_UPSTREAM_PORTS = ""

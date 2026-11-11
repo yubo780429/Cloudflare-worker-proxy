@@ -114,3 +114,40 @@ WS / DoH(POST+GET) / gRPC-Web / trailers-only / Alt-Svc 删除 / 421 白名单 /
 - README 工具链更正：wrangler@3 → wrangler@4（生产部署实际使用 4.160.0）。
 
 复现环境新增：上游端点 /__echo_headers、/__setcookie_multi、/__slow、/__sse；测试 test-headers.js、test-cookies.js、test-timeout.js、test-sse.js。
+
+## 十一、非标准端口 9090 线上复验（2026-11-11）
+
+触发与结论：并行 DoH 检测中，经本 Worker 的自定义域节点 A / AAAA 均报 `can't receive reply from <边缘 IP>@443(HTTPS)`，其余 4 个节点正常，怀疑 9090 非标端口反代失效。核对与复验后确认：**worker.js 端口链路无变化、无回归；当前线上 9090 反代端到端可用**；失败日志产生于上游变量与白名单更新之前，属于配置阶段的结果。代码无需修改，也无需重新部署。
+
+### 代码核对
+
+`worker.js` 仍为 02:48 版（33312 B，md5 `eec735f4e679ab48976143209cdbab07`），与部署 5 一致。逐处核对：配置解析（`PROXY_UPSTREAM_PORTS` 并行列表、`normalizePort` 1-65535 校验、兼容旧单端口变量）、`selectUpstream` 按 `PROXY_PUBLIC_HOSTS` 选块、`handleRequest` 中 `upstreamUrl.port` 赋值、`buildUpstreamRequest` 显式 RequestInit 构造、Origin / Referer / Location 的端口同步改写 —— 全部与非标端口需求落地版本一致。后续的并行变量重构、隐私脱敏、配置告警、日志脱敏、断言补测均未影响这条链路。
+
+### 本地 workerd 复验
+
+wrangler 4.160.0 + 两个本地上游 `127.0.0.1:9090` / `127.0.0.1:20252`，`PROXY_UPSTREAM_PROTOCOL=http`，`PROXY_UPSTREAM_PORTS=9090,20252`，`PROXY_PUBLIC_HOSTS` 按对外域名分流，诊断头开启。**10/10 PASS**：按域名分流端口（上游自报端口 + `X-Reverse-Proxy-Upstream` 双重确认）、DoH GET / POST（9090）与 GET（20252）、Origin / Referer 端口改写、伪造转发头清理、Alt-Svc 删除、12 路并发 DoH、非白名单 Host 返回 421。新增可复现脚本 `proxy-verify/test-ports.js`。
+
+### 线上复验
+
+所有请求带随机 `_cb` 绕缓存，域名均已脱敏（自定义域记为 `cfrp.example.com`，上游记为 `upstream.example.com`）。
+
+| 项目 | 线上经 Worker | 直连上游 9090 | 直连上游 443 |
+|---|---|---|---|
+| `GET /__proxy_health` | 200 | — | — |
+| DoH GET / POST A | 200，156 B，`application/dns-message`，flags `0x8180` AN=8 | 200，156 B，逐字节一致 | — |
+| DoH GET AAAA | 200，252 B，AN=8 | — | — |
+| DoH GET 不带 `Accept` | 200，156 B | — | — |
+| `GET /` | 404 `Not Found` | 404 `Not Found` | TLS 握手失败 |
+| POST 畸形 wireformat | 400 `Bad Request` | 400 `Bad Request` | — |
+
+根路径 404、畸形报文 400 这类响应体只有 9090 上的服务会产生，而直连 443 连 TLS 握手都不通，因此部署后的 Worker 子请求确实命中 9090，**端口没有被平台忽略**。
+
+官方限制核实：Cloudflare Workers Known issues（页面标注 2026-09-28 更新）当前已不再列出"部署态忽略自定义端口、回落协议默认端口"这一条；旧版文档与社区曾记载该限制，并提到同 zone 场景可放行非标端口。本环境实证为可用路径；跨 zone、换账户或更换上游域名时仍建议复验一次。
+
+### 原因与复发风险
+
+- **时间线**：用户脚本时间戳早于部署 4（上游切换到 9090）与部署 5（新版 worker.js 上线），当时上游变量或白名单尚未指向 9090 / 自定义域，请求快速返回非 DNS 应答。建议在运行脚本的那台服务器上原样重跑一次检测脚本确认。
+- **配置隐患（本次已处理）**：本地 `wrangler.toml` 被重置为空值模板（`account_id` / `PROXY_ALLOWED_HOSTS` / `PROXY_UPSTREAM_HOSTS` / `PROXY_UPSTREAM_PORTS` 全空）。用这份配置部署会同时触发白名单空 → 421、端口空 → 回落 443，必然复现同一故障。已加醒目注释：部署前必填 4 项、非标端口必须显式填写、`wrangler deploy` 会覆盖 Dashboard 同名变量、白名单必须包含线上实际使用的自定义域名；按隐私脱敏约定未填回真实值。
+- **排障映射**：`421` = 白名单缺域名；`502/504` = 上游主机 / 端口 / 协议变量错；`200` 但非 `application/dns-message` = 用了 JSON API 或路径写错（上游仅 RFC 8484 `/dns-query`）；以 IP 直连且 Host 为 IP 同样会 421。
+
+逐项原始数据与服务器侧等价复跑命令见 `cloudflare-reverse-proxy/log.md` 第七章。
