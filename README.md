@@ -185,8 +185,6 @@ cloudflare-reverse-proxy/
 ├── verify-report.md           # 协议验证报告
 
 
-
-proxy-verify/      # 验证与复现环境（上游服务器 + 协议测试客户端 + 验证报告）
 ```
 
 依赖方向单向，底层模块只接收参数并返回结果，不反向导入编排层：
